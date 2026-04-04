@@ -28,7 +28,7 @@ conda activate $ENV_NAME
 
 # Install PyTorch (CPU version — works on any machine including yours)
 echo "[3/4] Installing PyTorch (CPU)..."
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install torch==1.7.1 torchvision==0.8.2 torchaudio==0.7.2 --index-url https://download.pytorch.org/whl/cpu
 
 # Install other dependencies
 echo "[4/4] Installing other packages..."

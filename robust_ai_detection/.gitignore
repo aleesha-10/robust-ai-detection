@@ -1,0 +1,16 @@
+# Dataset — too large for GitHub
+robust_ai_detection/data/cifake/
+
+# Model checkpoint — large binary file
+robust_ai_detection/results/checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Conda/pip
+*.egg-info/
+dist/
+build/
