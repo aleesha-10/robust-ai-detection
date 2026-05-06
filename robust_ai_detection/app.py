@@ -249,8 +249,8 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 RESNET_SIZE   = 32
 CLIP_SIZE     = 224
 
-RESNET_CKPT = "resnet18_best.pth"
-CLIP_CKPT   = "clip_head_best.pth"
+RESNET_CKPT = "results/checkpoints/best_resnet18_baseline.pt"
+CLIP_CKPT   = "results/checkpoints/best_clip_mlp.pt"
 
 # ── MLP head matching your training code ────────────────────────────────────
 class CLIPHead(nn.Module):
@@ -271,16 +271,45 @@ class CLIPHead(nn.Module):
         return self.net(x)
 
 
-# ── model loading (cached so it only runs once per session) ──────────────────
 @st.cache_resource(show_spinner=False)
 def load_resnet(ckpt_path: str, device: str):
-    """Load ResNet18 with a 2-class head. Falls back to random weights if checkpoint missing."""
-    model = models.resnet18(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, 2)
+    class ResNetDetector(nn.Module):
+        def __init__(self):
+            super().__init__()
+            base = models.resnet18(weights=None)
+            self.backbone = nn.Sequential(
+                base.conv1,    # 0
+                base.bn1,      # 1
+                base.relu,     # 2
+                base.maxpool,  # 3
+                base.layer1,   # 4
+                base.layer2,   # 5
+                base.layer3,   # 6
+                base.layer4    # 7
+            )
+            self.classifier = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),  # 0
+                nn.Linear(512, 256),      # 1
+                nn.ReLU(),                # 2
+                nn.Dropout(0.3),          # 3
+                nn.Linear(256, 2)         # 4
+            )
+        def forward(self, x):
+            x = self.backbone(x)
+            x = self.classifier[0](x)  # pool
+            x = x.flatten(1)
+            x = self.classifier[1](x)  # linear
+            x = self.classifier[2](x)  # relu
+            x = self.classifier[3](x)  # dropout
+            x = self.classifier[4](x)  # linear
+            return x
+
+    model = ResNetDetector()
     if os.path.exists(ckpt_path):
         state = torch.load(ckpt_path, map_location=device)
-        # handle both raw state_dict and checkpoint dicts
-        if "model_state_dict" in state:
+        if "state_dict" in state:
+            state = state["state_dict"]
+        elif "model_state_dict" in state:
             state = state["model_state_dict"]
         model.load_state_dict(state)
         loaded = True
@@ -289,58 +318,68 @@ def load_resnet(ckpt_path: str, device: str):
     model.to(device).eval()
     return model, loaded
 
-
 @st.cache_resource(show_spinner=False)
 def load_clip(head_ckpt_path: str, device: str):
-    """Load frozen CLIP ViT-L/14 + trainable MLP head."""
     if not CLIP_AVAILABLE:
         return None, None, False
 
-    clip_model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-L-14", pretrained="openai"
-    )
-    clip_model.to(device).eval()
-    for p in clip_model.parameters():
-        p.requires_grad_(False)
+    class CLIPDetector(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.clip_model, _, _ = open_clip.create_model_and_transforms(
+                "ViT-L-14", pretrained="openai"
+            )
+            self.mlp = nn.Sequential(
+                nn.Linear(768, 256),  # 0
+                nn.ReLU(),            # 1
+                nn.Dropout(0.3),      # 2
+                nn.Linear(256, 128),  # 3
+                nn.ReLU(),            # 4
+                nn.Dropout(0.3),      # 5
+                nn.Linear(128, 2)     # 6
+            )
+        def forward(self, x):
+            return self.mlp(x)
 
-    head = CLIPHead(in_dim=768)
+    model = CLIPDetector()
     if os.path.exists(head_ckpt_path):
         state = torch.load(head_ckpt_path, map_location=device)
-        if "model_state_dict" in state:
-            state = state["model_state_dict"]
-        head.load_state_dict(state)
+        if "state_dict" in state:
+            state = state["state_dict"]
+        model.load_state_dict(state)
         loaded = True
     else:
         loaded = False
-    head.to(device).eval()
-    return clip_model, head, loaded
 
+    clip_model = model.clip_model.to(device).eval()
+    for p in clip_model.parameters():
+        p.requires_grad_(False)
+
+    head = model.mlp.to(device).eval()
+    return clip_model, head, loaded
 
 # ── preprocessing ────────────────────────────────────────────────────────────
 def get_resnet_transform(jpeg_quality: int = None, resize_factor: float = None):
     ops = []
     if resize_factor and resize_factor < 1.0:
-        # bilinear down then up — same as your test protocol
         ops.append(T.Lambda(lambda img: img.resize(
             (max(1, int(img.width * resize_factor)),
              max(1, int(img.height * resize_factor))),
-            Image.BILINEAR
+            Image.Resampling.BILINEAR
         )))
-        ops.append(T.Lambda(lambda img: img.resize(
-            (RESNET_SIZE, RESNET_SIZE), Image.BILINEAR
-        )))
-    else:
-        ops.append(T.Resize((RESNET_SIZE, RESNET_SIZE)))
-
     if jpeg_quality and jpeg_quality < 100:
-        def apply_jpeg(img):
+        def apply_jpeg_r(img):
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=jpeg_quality)
             buf.seek(0)
             return Image.open(buf).convert("RGB")
-        ops.append(T.Lambda(apply_jpeg))
-
-    ops += [T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
+        ops.append(T.Lambda(apply_jpeg_r))
+    ops.append(T.Resize((32, 32)))
+    ops += [
+        T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225])
+    ]
     return T.Compose(ops)
 
 
@@ -350,25 +389,22 @@ def get_clip_transform(jpeg_quality: int = None, resize_factor: float = None):
         ops.append(T.Lambda(lambda img: img.resize(
             (max(1, int(img.width * resize_factor)),
              max(1, int(img.height * resize_factor))),
-            Image.BILINEAR
+            Image.Resampling.BILINEAR
         )))
-        ops.append(T.Lambda(lambda img: img.resize(
-            (CLIP_SIZE, CLIP_SIZE), Image.BILINEAR
-        )))
-    else:
-        ops.append(T.Resize((CLIP_SIZE, CLIP_SIZE)))
-
     if jpeg_quality and jpeg_quality < 100:
-        def apply_jpeg(img):
+        def apply_jpeg_c(img):
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=jpeg_quality)
             buf.seek(0)
             return Image.open(buf).convert("RGB")
-        ops.append(T.Lambda(apply_jpeg))
-
-    ops += [T.ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
+        ops.append(T.Lambda(apply_jpeg_c))
+    ops.append(T.Resize((224, 224)))
+    ops += [
+        T.ToTensor(),
+        T.Normalize(mean=[0.48145466, 0.4578275,  0.40821073],
+                    std=[0.26862954, 0.26130258, 0.27577711])
+    ]
     return T.Compose(ops)
-
 
 # ── inference helpers ────────────────────────────────────────────────────────
 @torch.no_grad()
