@@ -44,7 +44,9 @@ robust_ai_detection/
 ├── train.py                     # Training script
 ├── evaluate.py                  # Full evaluation with distribution shift testing
 ├── run_experiments.py           # Runs all experiments end-to-end
-│
+│__ evaluate_domain_shift        # for domain shift
+|__ evaluate_generator_shift     # for generator shift
+| 
 ├── results/                     # Auto-created: logs, plots, model checkpoints
 └── notebooks/
     └── analysis.ipynb           # Interactive analysis notebook
